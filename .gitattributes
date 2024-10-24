@@ -1,0 +1,22 @@
+# GitHub Linguist Coloring
+*.md linguist-language=Markdown 
+*.md linguist-generated=false
+*.md linguist-documentation=false
+*.md linguist-detectable=true
+*.dm text linguist-language=Darkmatter eol=lf
+*.asm text linguist-language=Assembly eol=lf
+*.ll text linguist-language=LLVM eol=lf
+*.java text linguist-language=Java eol=lf
+*.kts text linguist-language=Kotlin eol=lf
+*.js text linguist-language=JavaScript eol=lf
+*.py text linguist-language=Python eol=lf
+*.rs text linguist-language=Rust eol=lf
+*.js text linguist-language=JavaScript eol=lf
+*.sh text linguist-language=Shell eol=lf
+*.bat linguist-language=Batchfile
+*.ps1 linguist-language=Powershell
+*.lua text linguist-language=Lua eol=lf
+*.json linguist-language=JSON
+*.toml text linguist-language=TOML eol=lf
+
+*.bin binary

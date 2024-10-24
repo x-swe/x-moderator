@@ -1,0 +1,59 @@
+syntax = "proto3";
+
+package xmoderator;
+
+// Service definitions
+service XModeratorBot {
+  rpc getPostByPostId (PostIdRequest) returns (Post);
+  rpc getUserByUserId (UserIdRequest) returns (User);
+  rpc getPostWithUser (PostIdRequest) returns (PostWithUser);
+}
+
+// Request message for fetching a post by its X/Twitter post ID
+message PostIdRequest {
+  string post_id = 1;
+}
+
+// Request message for fetching a user by its X/Twitter user ID
+message UserIdRequest {
+  string user_id = 1;
+}
+
+// Message representing a user
+message User {
+  string user_id = 1;  // X/Twitter user ID
+  string username = 2; // @username
+  string display_name = 3;
+}
+
+// Message representing a post
+message Post {
+  string post_id = 1;              // X/Twitter post ID
+  string content = 2;              // Post message
+  string timestamp = 3;            // When the post was made
+  repeated string images = 4;      // URLs or paths to images
+  repeated string attachments = 5; // Other attached content
+}
+
+// Combined message for a post with its user details
+message PostWithUser {
+  Post post = 1;
+  User user = 2;
+}
+
+// System messages for operational commands or status updates
+service System {
+  rpc Ping (Empty) returns (Status);
+  rpc UpdateBotConfig (BotConfig) returns (Status);
+}
+
+message Empty {}
+
+message Status {
+  bool success = 1;
+  string message = 2;
+}
+
+message BotConfig {
+  map<string, string> settings = 1;
+}

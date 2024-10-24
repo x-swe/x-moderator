@@ -1,0 +1,40 @@
+# Global
+
+## Operating System
+.DS_Store
+Thumbs.db
+
+# Project specific
+
+## x-moderator-api
+api/bin/
+api/target/
+api/model/*
+!api/model/example_embed.json
+!api/model/example_manfest.json
+
+## x-moderator-bot
+bot/bin/
+bot/target/
+bot/build/
+
+## x-moderator-mariadb
+mariadb/*
+!mariadb/mariadb_example.cnf
+
+## x-moderator-qdrant
+qdrant/*
+!qdrant/qdrant_example.yaml
+
+## x-moderator-migrator
+migrator/bin/
+migrator/__pycache__
+migrator/migrations/*_wip
+
+## x-moderator-se (selenium)
+selenium/assets/*
+!selenium/assets/.gitkeep
+selenium/downloads/*
+!selenium/downloads/.gitkeep
+selenium/config.toml
+!selenium/example_config.toml

@@ -1,0 +1,21 @@
+[package]
+name = "x-moderator-api"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.0", features = ["derive"] }
+env_logger = "0.10"
+log = "0.4"
+tokio = { version = "1.0", features = ["full"] }
+tonic = { version = "0.8", features = ["transport", "codegen"] }
+sqlx = { version = "0.6", features = ["mysql", "runtime-tokio-rustls", "macros"] }
+qdrant-client = "0.1"
+rustls = "0.20"
+
+[build-dependencies]
+tonic-build = "0.8"
+
+[dev-dependencies]
+tonic-build = "0.8"
