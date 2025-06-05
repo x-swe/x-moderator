@@ -1,6 +1,4 @@
 # Project specific
-/*/target/
-/*/bin/
 /migrator/__pycache__/*
 /migrator/migrations/*
 !/migrator/migrations/*_*-*
@@ -8,18 +6,22 @@
 
 # Configuration
 /backend/config.toml
-!/backend/example.config.toml
 /bot/config.toml
-!/bot/example.config.toml
 /dash/config.toml
+!/backend/example.config.toml
+!/bot/example.config.toml
 !/dash/example.config.toml
 
 # Binaries
-/bin/
-/target/
-/*.bin
-/*.swp
-/*.tmp
+/backend/bin/
+/backend/target/
+/bot/bin/
+/bot/target/
+/dash/bin/
+/dash/target/
+*.bin
+*.swp
+*.tmp
 
 # OS garbage
 .DS_Store

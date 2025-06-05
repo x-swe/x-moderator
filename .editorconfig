@@ -20,6 +20,10 @@ indent_size = 4
 [Makefile]
 indent_style = tab
 
-[*.{asm,c,h,cpp,hpp,glsl,java,lua,json,html,js,css,php,sql,dm,sh,toml,rs,dockerfile,hbs,mustache}]
+[*.{asm,ll,c,h,cpp,hpp,glsl,java,lua,json,html,css,js,css,php,sql,dm,sh,toml,rs,dockerfile,hbs,mustache}]
+indent_style = tab
+indent_size = 4
+
+[Dockerfile]
 indent_style = tab
 indent_size = 4
