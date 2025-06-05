@@ -1,34 +1,32 @@
-FROM debian:trixie-slim
-LABEL name="x-moderator-migrator"
+FROM python:3.9-slim
+LABEL name="xmod-migrator"
 LABEL description="RDB migration tool"
-LABEL maintainer="Anthony Waldsmith <awaldsmith@protonmail.com>"
+LABEL maintainer="Anthony Waldsmith <me@anthonyw.me>"
 
+# Install dependencies
 RUN apt-get update -y \
-	&& apt-get install -y --no-install-recommends \
-		bash \
-		gcc \
-		git \
-		make \
-		curl \
-		python3-dev \
-		python3-venv \
-		python3-pip \
-		libmariadb-dev \
-		mariadb-client \
-	&& apt-get clean \
-	&& rm -rf /var/lib/apt/lists/*
+    && apt-get install -y --no-install-recommends \
+        gcc \
+        libmariadb-dev \
+        mariadb-client \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
 
-RUN useradd --create-home --shell /bin/bash xmoderator \
-	&& chown -R xmoderator:xmoderator /home/xmoderator
+# Create user
+RUN useradd --create-home --shell /bin/bash xmod
+USER xmod
+WORKDIR /home/xmod
 
-USER xmoderator
+# Create virtual environment
+RUN python3 -m venv .venv
+ENV PATH="/home/xmod/.venv/bin:$PATH"
 
-WORKDIR /home/xmoderator
+# Install Python dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
-RUN python3 -m venv .venv \
-	&& . .venv/bin/activate \
-	&& pip install mariadb==1.1.7 argparse
+# Mount point for project files
+VOLUME /mnt
 
-VOLUME /home/xmoderator
-
-CMD ["/bin/bash"]
+# Default command
+CMD ["python3", "/mnt/migrator.py"]
