@@ -1,7 +1,0 @@
-# Project specific
-bin/
-model/
-target/
-*.lock
-*.json
-*.md

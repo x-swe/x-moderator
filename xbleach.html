@@ -1,0 +1,328 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>X Bleach</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 20px; background-color: #f9f9f9; color: #333; }
+    h1 { text-align: center; color: #1a73e8; margin-bottom: 20px; }
+    .container { display: flex; justify-content: space-between; gap: 20px; max-width: 1200px; margin: 0 auto; }
+    .panel { flex: 1; background-color: #fff; padding: 15px; border-radius: 8px; box-shadow: 0 4px 10px rgba(0,0,0,0.1); }
+    h2 { font-size: 1.2em; margin-bottom: 10px; color: #555; }
+    textarea { width: 100%; height: 400px; border: 1px solid #ddd; border-radius: 5px; padding: 10px; font-family: 'Courier New', monospace; font-size: 14px; resize: vertical; box-sizing: border-box; }
+    textarea:focus { border-color: #1a73e8; outline: none; }
+    button { display: block; margin: 20px auto 0; padding: 12px 30px; background-color: #1a73e8; color: #fff; border: none; border-radius: 5px; font-size: 16px; cursor: pointer; transition: background-color 0.3s; }
+    button:hover { background-color: #1557b0; }
+    button:active { background-color: #0d47a1; }
+  </style>
+</head>
+<body>
+  <h1>X Bleach</h1>
+  <div class="container">
+    <div class="panel">
+      <h2>Paste X HTML Here</h2>
+      <textarea id="htmlInput" placeholder="Paste X HTML here..."></textarea>
+    </div>
+    <div class="panel">
+      <h2>Extracted Data (JSON)</h2>
+      <textarea id="jsonOutput" readonly></textarea>
+    </div>
+  </div>
+  <button id="bleachBtn">Bleach</button>
+  <script>
+    const logger = {
+      logs: [],
+      log: function(message) { console.log(message); this.logs.push(message); },
+      error: function(message) { console.error(message); this.logs.push(`ERROR: ${message}`); },
+      getLogs: function() { return this.logs.join('\n'); }
+    };
+
+    function findElementsWithText(root, text) {
+      const elements = [];
+      function traverse(node) {
+        if (!node || node.nodeType !== Node.ELEMENT_NODE) return;
+        if (node.textContent?.toLowerCase().includes(text.toLowerCase())) elements.push(node);
+        node.childNodes.forEach(child => traverse(child));
+      }
+      traverse(root);
+      logger.log(`Found ${elements.length} elements containing "${text}"`);
+      return elements;
+    }
+
+    function parseRelativeTime(text) {
+      if (!text) return null;
+      const match = text.match(/(\d+)([smhdw])/i);
+      if (!match) { logger.log(`Could not parse relative time: "${text}"`); return null; }
+      const value = parseInt(match[1]);
+      const unit = match[2].toLowerCase();
+      const now = new Date();
+      const units = { s: 1000, m: 60000, h: 3600000, d: 86400000, w: 604800000 };
+      const milliseconds = units[unit] * value;
+      const timestamp = new Date(now - milliseconds).toISOString();
+      logger.log(`Parsed "${text}" to ${timestamp}`);
+      return timestamp;
+    }
+
+    function extractUserData(post) {
+      const postId = post.getAttribute('data-post-id');
+      const userDiv = post.querySelector('[data-testid="User-Name"]') || post.querySelector('div[dir="ltr"]');
+      if (!userDiv) {
+        logger.error(`Post ${postId}: No user data div found`);
+        return { display_name: 'Unknown', handle: 'unknown', userId: 'unknown', profile_picture_url: null, is_mod: false, is_admin: false };
+      }
+      const displayNameEl = userDiv.querySelector('span:not([class*="css-"])') || userDiv.querySelector('span');
+      const handleEl = Array.from(userDiv.querySelectorAll('span')).find(span => span.textContent.startsWith('@')) || userDiv.querySelector('span:nth-child(2)');
+      const display_name = displayNameEl?.textContent.trim() || 'Unknown';
+      const handle = handleEl?.textContent.trim().replace(/^@/, '') || 'unknown';
+      const roleSpan = Array.from(userDiv.querySelectorAll('span')).find(span => /mod|admin/i.test(span.textContent));
+      const is_mod = roleSpan?.textContent.toLowerCase().includes('mod') || false;
+      const is_admin = roleSpan?.textContent.toLowerCase().includes('admin') || false;
+      const profileImg = post.querySelector('img[src*="profile_images"]');
+      const profile_picture_url = profileImg?.src || null;
+      const userIdMatch = profile_picture_url?.match(/profile_images\/(\d+)\//);
+      const userId = userIdMatch ? userIdMatch[1] : handle;
+      logger.log(`Post ${postId}: User - Handle="${handle}", Name="${display_name}", ID="${userId}", Profile="${profile_picture_url}", Mod=${is_mod}, Admin=${is_admin}`);
+      return { display_name, handle, userId, profile_picture_url, is_mod, is_admin };
+    }
+
+    function extractPostText(post) {
+      const postId = post.getAttribute('data-post-id');
+      const tweetText = post.querySelector('[data-testid="tweetText"]');
+      if (!tweetText) {
+        logger.error(`Post ${postId}: No tweetText found`);
+        return 'No content extracted';
+      }
+      let text = '';
+      const nodes = tweetText.childNodes;
+      nodes.forEach(node => {
+        if (node.nodeType === Node.TEXT_NODE) {
+          text += node.textContent;
+        } else if (node.nodeType === Node.ELEMENT_NODE) {
+          if (node.tagName === 'IMG') {
+            const alt = node.getAttribute('alt');
+            text += alt ? alt : ':emote:';
+          } else {
+            text += node.textContent;
+          }
+        }
+      });
+      text = text.trim().replace(/\s+/g, ' ');
+      logger.log(`Post ${postId}: Extracted text: "${text.slice(0, 50)}..."`);
+      return text || 'No content extracted';
+    }
+
+    function extractAttachments(post) {
+      const postId = post.getAttribute('data-post-id');
+      const attachments = [];
+      const mediaElements = post.querySelectorAll('img, video');
+      mediaElements.forEach(el => {
+        const src = el.getAttribute('src') || el.querySelector('source')?.getAttribute('src');
+        if (src && !src.includes('profile_images') && !src.includes('emoji')) {
+          attachments.push({ type: el.tagName.toLowerCase(), url: src });
+        }
+      });
+      const links = post.querySelectorAll('a[href]');
+      links.forEach(link => {
+        const href = link.getAttribute('href');
+        if (href && !href.startsWith('/')) attachments.push({ type: 'link', url: href });
+      });
+      logger.log(`Post ${postId}: Found ${attachments.length} attachments`);
+      return attachments.length > 0 ? attachments : null;
+    }
+
+    function parseEngagementStats(post) {
+      const postId = post.getAttribute('data-post-id');
+      const statsDiv = post.querySelector('div[role="group"][aria-label]');
+      if (!statsDiv) {
+        logger.error(`Post ${postId}: No engagement stats div found`);
+        return { replies: 0, reposts: 0, likes: 0, bookmarks: 0, views: 0 };
+      }
+      const ariaLabel = statsDiv.getAttribute('aria-label');
+      const stats = { replies: 0, reposts: 0, likes: 0, bookmarks: 0, views: 0 };
+      const parts = ariaLabel.split(', ');
+      parts.forEach(part => {
+        const match = part.match(/(\d+)\s*(replies|reposts|likes|bookmarks|views)/i);
+        if (match) {
+          const [, number, type] = match;
+          stats[type.toLowerCase()] = parseInt(number, 10);
+        }
+      });
+      logger.log(`Post ${postId}: Parsed stats - Replies=${stats.replies}, Reposts=${stats.reposts}, Likes=${stats.likes}, Bookmarks=${stats.bookmarks}, Views=${stats.views}`);
+      return stats;
+    }
+
+    function extractCommunityInfo(doc) {
+      return {
+        title: extractCommunityTitle(doc),
+        description: extractCommunityDescription(doc),
+        members: extractCommunityMemberCount(doc),
+        member_count: extractCommunityMemberCount(doc), // Included for clarity
+        rules: extractCommunityRules(doc),
+        moderators: extractCommunityModerators(doc),
+        mod_count: extractCommunityModerators(doc).length
+      };
+    }
+
+    function extractCommunityTitle(doc) {
+      const titleEl = doc.querySelector('h1, h2, [data-testid="community-header"] span');
+      return titleEl?.textContent.trim() || 'Unknown Community';
+    }
+
+    function extractCommunityDescription(doc) {
+      const descEl = doc.querySelector('p, span:not([class*="css-"])');
+      return descEl?.textContent.trim() || 'No description available';
+    }
+
+    function extractCommunityMemberCount(doc) {
+      const memberEl = findElementsWithText(doc, 'Members')[0];
+      const match = memberEl?.textContent.match(/(\d+\.?\d*)\s*(K|M)?\s*Members/i);
+      if (match) {
+        let count = parseFloat(match[1]);
+        if (match[2] === 'K') count *= 1000;
+        if (match[2] === 'M') count *= 1000000;
+        return Math.round(count).toString();
+      }
+      return '0';
+    }
+
+    function extractCommunityRules(doc) {
+      const rulesSections = findElementsWithText(doc, 'Rules');
+      const rules = [];
+      rulesSections.forEach(section => {
+        const ruleList = section.closest('div')?.querySelector('ol, ul');
+        if (ruleList) {
+          Array.from(ruleList.querySelectorAll('li')).forEach((li, i) => {
+            rules.push({ id: `rule-${i + 1}`, text: li.textContent.trim() });
+          });
+        }
+      });
+      return rules.length > 0 ? rules : [];
+    }
+
+    function extractCommunityModerators(doc) {
+      const modElements = findElementsWithText(doc, 'Moderators');
+      const moderators = [];
+      modElements.forEach(section => {
+        const modList = section.closest('div')?.querySelectorAll('[data-testid="User-Name"], span');
+        if (modList) {
+          Array.from(modList).forEach((mod, i) => {
+            const nameEl = mod.querySelector('span:not([class*="css-"])') || mod;
+            const handleEl = mod.querySelector('span')?.textContent.startsWith('@') ? mod.querySelector('span') : null;
+            moderators.push({
+              id: `mod-${i + 1}`,
+              name: nameEl?.textContent.trim() || 'Unknown',
+              handle: handleEl?.textContent.trim().replace(/^@/, '') || 'unknown'
+            });
+          });
+        }
+      });
+      return moderators.length > 0 ? moderators : [];
+    }
+
+    document.getElementById('bleachBtn').addEventListener('click', () => {
+      const input = document.getElementById('htmlInput').value.trim();
+      const outputEl = document.getElementById('jsonOutput');
+      logger.logs = [];
+      if (!input) {
+        logger.error('No HTML input provided');
+        outputEl.value = JSON.stringify({ error: 'No input provided', logs: logger.getLogs() }, null, 2);
+        return;
+      }
+      let doc;
+      try {
+        const parser = new DOMParser();
+        doc = parser.parseFromString(input, 'text/html');
+        if (!doc.documentElement) throw new Error('Invalid HTML structure');
+        logger.log('HTML parsed successfully');
+      } catch (e) {
+        logger.error(`Failed to parse HTML: ${e.message}`);
+        outputEl.value = JSON.stringify({ error: `HTML parsing failed: ${e.message}`, logs: logger.getLogs() }, null, 2);
+        return;
+      }
+      if (!doc.body) {
+        doc.body = doc.createElement('body');
+        doc.documentElement.appendChild(doc.body);
+        Array.from(doc.documentElement.childNodes).forEach(node => {
+          if (node.nodeName !== 'HEAD') doc.body.appendChild(node);
+        });
+        logger.log('Created body element for malformed HTML');
+      }
+      const pageType = (() => {
+        if (doc.querySelector('[data-testid="community-header"]') || findElementsWithText(doc, 'Members').length > 0) return 'community';
+        if (doc.querySelector('[data-testid="UserProfileHeader_Items"]')) return 'profile';
+        if (doc.querySelector('article[data-testid="tweet"]')) return 'tweet';
+        return 'unknown';
+      })();
+      logger.log(`Detected page type: ${pageType}`);
+      doc.querySelectorAll('script, style').forEach(el => el.remove());
+      logger.log('Removed script and style tags');
+      const postSelectors = {
+        community: '[data-testid="cellInnerDiv"], div[role="article"]',
+        profile: '[data-testid="tweet"]',
+        tweet: 'article[data-testid="tweet"]',
+        unknown: '[data-testid="tweet"], article, [role="article"], [data-testid="cellInnerDiv"]'
+      };
+      const posts = Array.from(doc.querySelectorAll(postSelectors[pageType] || postSelectors.unknown));
+      logger.log(`Found ${posts.length} posts`);
+      posts.forEach((post, i) => {
+        const tweetLink = post.querySelector('a[href*="/status/"]');
+        const postId = tweetLink?.href.split('/status/')[1] || `post-${i + 1}`;
+        post.setAttribute('data-post-id', postId);
+        post.setAttribute('data-keep', 'true');
+        logger.log(`Assigned ID ${postId} to post ${i + 1}`);
+      });
+      const extractedData = { posts: [], logs: '' };
+      if (pageType === 'community') {
+        const communityInfo = extractCommunityInfo(doc);
+        extractedData.community = {
+          title: communityInfo.title,
+          description: communityInfo.description,
+          members: communityInfo.members,
+          member_count: communityInfo.member_count,
+          rules: communityInfo.rules,
+          moderators: communityInfo.moderators,
+          mod_count: communityInfo.mod_count
+        };
+      }
+      const timeElements = Array.from(doc.querySelectorAll('time')).map(t => ({
+        datetime: t.getAttribute('datetime') || t.textContent,
+        postId: t.closest('[data-post-id]')?.getAttribute('data-post-id')
+      }));
+      posts.forEach(post => {
+        try {
+          const postId = post.getAttribute('data-post-id');
+          const text = extractPostText(post);
+          const userData = extractUserData(post);
+          const timestamp = timeElements.find(t => t.postId === postId)?.datetime.match(/T/)
+            ? timeElements.find(t => t.postId === postId).datetime
+            : parseRelativeTime(timeElements.find(t => t.postId === postId)?.datetime);
+          const stats = parseEngagementStats(post);
+          const attachments = extractAttachments(post);
+          const postData = {
+            id: postId,
+            text,
+            display_name: userData.display_name,
+            handle: userData.handle,
+            user_id: userData.userId,
+            profile_picture_url: userData.profile_picture_url,
+            likes: stats.likes || 0,
+            replies: stats.replies || 0,
+            reposts: stats.reposts || 0,
+            bookmarks: stats.bookmarks || 0,
+            views: stats.views || 0,
+            timestamp,
+            attachments,
+            is_mod: userData.is_mod,
+            is_admin: userData.is_admin
+          };
+          if (text && text !== 'No content extracted') extractedData.posts.push(postData);
+        } catch (e) {
+          logger.error(`Error processing post ${post.getAttribute('data-post-id')}: ${e.message}`);
+        }
+      });
+      extractedData.logs = logger.getLogs();
+      outputEl.value = JSON.stringify(extractedData, null, 2);
+    });
+  </script>
+</body>
+</html>

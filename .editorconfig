@@ -20,8 +20,6 @@ indent_size = 4
 [Makefile]
 indent_style = tab
 
-[*.{java,lua,json,sh,dm,sql,c,go,rs,js,hbs,html,as,proto,md}]
+[*.{asm,c,h,cpp,hpp,glsl,java,lua,json,html,js,css,php,sql,dm,sh,toml,rs,dockerfile,hbs,mustache}]
 indent_style = tab
 indent_size = 4
-quote_type = double
-indent_brace_style = K&R
