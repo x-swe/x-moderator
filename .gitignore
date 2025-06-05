@@ -9,6 +9,10 @@
 # Configuration
 /backend/config.toml
 !/backend/example.config.toml
+/bot/config.toml
+!/bot/example.config.toml
+/dash/config.toml
+!/dash/example.config.toml
 
 # Binaries
 /bin/
@@ -20,3 +24,7 @@
 # OS garbage
 .DS_Store
 Thumbs.db
+
+# IDE garbage
+.vscode
+.idea
