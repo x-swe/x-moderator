@@ -1,6 +1,6 @@
 # X-Moderator Migrator
 
-The X-Moderator Migrator is a Python-based tool for managing relational database schema migrations for the X-Moderator service, which automates moderation for X Communities.
+The X-Moderator Migrator is a tool for managing relational database schema migrations for the X-Moderator backend.
 
 ## Overview
 
@@ -27,6 +27,10 @@ Bot banning is configurable globally (`settings` with `key = 'bot.enable_banning
 - **`venv.sh`**: Activates the virtual environment for manual setups.
 
 ## Quick Start with Docker
+
+First run `./docker-bootstrap.sh` to download and/or start the required services (MariaDB, Qdrant, Valkey).
+
+Then run `./docker-build.sh` to build the migrator tool.
 
 ### Common Commands
 - **List migrations**: `./docker-run.sh --list`
