@@ -1,15 +1,25 @@
-#!/bin/bash
+#!/bin/sh
+set -e
 
-# Change directory to the current script directory
-DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"; cd "${DIR}"
-SCRIPT="$0"
+# Change to script's directory
+cd "$(dirname "$0")"
 
-source ./docker-config.sh
+# Configuration
+CONFIG_SCRIPT="./docker-config.sh"
 
-# Check if the Docker image exists
-if docker image inspect "${IMAGE_NAME}" &> /dev/null; then
-    echo -e "Docker image ${IMAGE_NAME} already exists!"
+# Configuration
+IMAGE_NAME=${IMAGE_NAME:-xmod-migrator}
+TAG="latest"
+BUILD_DIR="."
+
+# Check for Docker
+if ! command -v docker >/dev/null 2>&1; then
+    echo "Error: Docker not installed" >&2
     exit 1
 fi
 
-docker build -t "${IMAGE_NAME}" .
+# Build image
+echo "Building $IMAGE_NAME:$TAG..."
+docker build -t "$IMAGE_NAME:$TAG" "$BUILD_DIR"
+
+echo "Built $IMAGE_NAME:$TAG"

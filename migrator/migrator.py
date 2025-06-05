@@ -1,313 +1,640 @@
-#!/usr/bin/env python
-# -*- coding: utf-8 -*-
 import os
-import sys
-import platform
 import re
-import json
-import random
-import argparse
-import mariadb
+import time
 import logging
-from typing import List, Dict, Any
-from datetime import datetime, timezone
-from operator import itemgetter
-from contextlib import contextmanager
+import argparse
+from typing import List, Dict, Optional
+from datetime import datetime
+from mysql.connector import Error, connect
+from retrying import retry
+from pathlib import Path
 from names import ADJECTIVES, LAST_NAMES
+from tabulate import tabulate
 
-# Constants
-NAME = "migrator"
-VERSION = "1.0.1"
-SCHEMA_PATH = "migrations"
-DB_TABLE = "metadata"
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[logging.StreamHandler()]
+)
+logger = logging.getLogger(__name__)
 
-# Environment variables for database connection
-DB_HOST = os.environ.get("MIGRATOR_DB_HOSTNAME", "x-moderator-mariadb")
-DB_PORT = int(os.environ.get("MIGRATOR_DB_PORT", 3306))
-DB_NAME = os.environ.get("MIGRATOR_DB_NAME", "x_moderator")
-DB_USERNAME = os.environ.get("MIGRATOR_DB_USERNAME", "username")
-DB_PASSWORD = os.environ.get("MIGRATOR_DB_PASSWORD", "password")
+def strip_sql_comments(sql: str) -> str:
+    """Remove SQL comments (-- and /* */) while preserving SQL structure."""
+    result = []
+    i = 0
+    in_single_quote = False
+    in_double_quote = False
+    in_line_comment = False
+    in_multi_comment = False
+
+    while i < len(sql):
+        char = sql[i]
+
+        # Handle string literals
+        if char == "'" and not in_double_quote and not in_line_comment and not in_multi_comment:
+            in_single_quote = not in_single_quote
+            result.append(char)
+            i += 1
+            continue
+        if char == '"' and not in_single_quote and not in_line_comment and not in_multi_comment:
+            in_double_quote = not in_double_quote
+            result.append(char)
+            i += 1
+            continue
+
+        # Skip if inside a string
+        if in_single_quote or in_double_quote:
+            result.append(char)
+            i += 1
+            continue
+
+        # Handle line comments (--)
+        if char == '-' and i + 1 < len(sql) and sql[i + 1] == '-' and not in_multi_comment:
+            in_line_comment = True
+            i += 2
+            continue
+        if in_line_comment and char == '\n':
+            in_line_comment = False
+            result.append(char)
+            i += 1
+            continue
+        if in_line_comment:
+            i += 1
+            continue
+
+        # Handle multi-line comments (/* */)
+        if char == '/' and i + 1 < len(sql) and sql[i + 1] == '*' and not in_line_comment:
+            in_multi_comment = True
+            i += 2
+            continue
+        if in_multi_comment and char == '*' and i + 1 < len(sql) and sql[i + 1] == '/':
+            in_multi_comment = False
+            i += 2
+            continue
+        if in_multi_comment:
+            i += 1
+            continue
+
+        # Append non-comment characters
+        result.append(char)
+        i += 1
+
+    cleaned_sql = ''.join(result)
+    # Remove empty lines but preserve newlines within statements
+    lines = [line for line in cleaned_sql.splitlines() if line.strip()]
+    cleaned_sql = '\n'.join(lines)
+    logger.debug(f"Cleaned SQL:\n{cleaned_sql}")
+    return cleaned_sql.strip()
+
+def split_sql_statements(sql: str) -> List[str]:
+    """Split SQL into statements, preserving semicolons and respecting quoted strings."""
+    statements = []
+    current = []
+    in_single_quote = False
+    in_double_quote = False
+    i = 0
+
+    while i < len(sql):
+        char = sql[i]
+
+        # Handle string literals
+        if char == "'" and not in_double_quote:
+            in_single_quote = not in_single_quote
+            current.append(char)
+            i += 1
+            continue
+        if char == '"' and not in_single_quote:
+            in_double_quote = not in_double_quote
+            current.append(char)
+            i += 1
+            continue
+
+        # Handle semicolons outside quotes
+        if char == ';' and not in_single_quote and not in_double_quote:
+            current.append(char)  # Include the semicolon in the statement
+            statement = ''.join(current).strip()
+            if statement:
+                statements.append(statement)
+            current = []
+            i += 1
+            continue
+
+        current.append(char)
+        i += 1
+
+    # Add final statement if any
+    statement = ''.join(current).strip()
+    if statement:
+        statements.append(statement)
+
+    return statements
 
 class Migrator:
+    def __init__(self):
+        self.db_config = {
+            'host': os.getenv('DB_HOST', 'xmod-mariadb-1'),
+            'port': int(os.getenv('DB_PORT', 3306)),
+            'user': os.getenv('DB_USER', 'xmod'),
+            'password': os.getenv('DB_PASSWORD', 'password'),
+            'database': os.getenv('DB_NAME', 'xmod')
+        }
+        self.migrations_dir = Path('migrations')
+        self.connection = None
 
-    def __init__(self, logger):
-        self.logger = logger
-        self.conn = None
-
-    def _init_db(self):
-        if self.conn is None or self.conn.closed:
-            self.conn = self.db_connection()
-        return self.conn
-
-    def db_connection(self):
+    @retry(stop_max_attempt_number=3, wait_exponential_multiplier=1000, wait_exponential_max=10000)
+    def connect(self) -> None:
+        """Establish database connection with retries."""
         try:
-            conn = mariadb.connect(
-                host=DB_HOST,
-                user=DB_USERNAME,
-                password=DB_PASSWORD,
-                database=DB_NAME,
-            )
-            self.logger.info("Database connection established.")
-            return conn
-        except mariadb.Error as e:
-            self.logger.error(f"Failed to connect to database: {e}")
+            self.connection = connect(**self.db_config)
+            logger.info("Connected to database")
+        except Error as e:
+            logger.error(f"Failed to connect to database: {e}")
             raise
 
-    def create_schema(self) -> dict:
-        latest_version = max(version['version'] for version in self.get_available_versions()) if self.get_available_versions() else 0
-        new_version = latest_version + 1
+    def close(self) -> None:
+        """Close database connection if open."""
+        if self.connection and self.connection.is_connected():
+            self.connection.close()
+            logger.info("Database connection closed")
+            self.connection = None
 
-        adjective = random.choice(names.ADJECTIVES)
-        last_name = random.choice(names.LAST_NAMES)
-        schema_name = f"{adjective}-{last_name}"
+    def ensure_connected(self) -> bool:
+        """Ensure database connection is established."""
+        if self.connection is None or not self.connection.is_connected():
+            try:
+                self.connect()
+                return True
+            except Error:
+                logger.error("Failed to establish database connection")
+                return False
+        return True
 
-        new_schema_path = os.path.join(SCHEMA_PATH, str(new_version))
-        os.makedirs(new_schema_path, exist_ok=True)
-
-        for sql_type in ["up", "down"]:
-            file_content = f"""-- Schema Overlay: {schema_name} ({new_version})
--- Created On: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
---
--- DO NOT EDIT THIS FILE AFTER IT HAS BEEN COMMITTED
--- CREATE A NEW SCHEMA OVERLAY `migrator.py create` INSTEAD
---
-"""
-
-            with open(os.path.join(new_schema_path, f"{sql_type}.sql"), "w") as f:
-                f.write(file_content)
-
-        # Update Manifest (assuming manifest.json exists)
-        if os.path.exists(f"{SCHEMA_PATH}/manifest.json"):
-            with open(f"{SCHEMA_PATH}/manifest.json", "r+") as file:
-                data = json.load(file)
-                data.append({"version": new_version, "name": schema_name, "date": datetime.now().isoformat()})
-                file.seek(0)
-                json.dump(data, file, indent='\t')
-                file.truncate()
-
-        self.logger.info(f"Created new schema version at: {new_schema_path}")
-        return {"version": new_version, "name": schema_name}
-
-    def _update_metadata(self, cursor, version: int):
+    def get_applied_migrations(self) -> List[Dict]:
+        """Retrieve applied migrations from the migrations table."""
+        if not self.ensure_connected():
+            logger.debug("No database connection; assuming no applied migrations")
+            return []
         try:
-            self.logger.info("Attempting to update metadata...")
-
-            cursor.execute("UPDATE metadata SET `value` = %s, `date_updated` = UNIX_TIMESTAMP() WHERE `key` = 'migration_data'", (json.dumps({"version": version}),),)
-
-            if cursor.rowcount == 0:
-                cursor.execute("INSERT INTO metadata (`key`, `value`, `date_updated`) VALUES (%s, %s, UNIX_TIMESTAMP())", ("migration_data", json.dumps({"version": version})),)
-
-            self.logger.info(f"Metadata updated to version {version}")
-
-            cursor.connection.commit()
-            self.logger.info("Transaction committed for metadata update.")
-            cursor.execute("SELECT `value` FROM metadata WHERE `key` = 'migration_data' ORDER BY `date_updated` DESC LIMIT 1")
-            result = cursor.fetchone()
-            if result:
-                current_version = json.loads(result[0])["version"]
-                self.logger.info(f"Current version after metadata update: {current_version}")
-                if current_version != version:
-                    self.logger.error(f"Version mismatch after update attempt. Set to {version}, but got {current_version}")
-            else:
-                self.logger.error("Failed to find the updated version in metadata or no rows exist after operation.")
-        except mariadb.Error as e:
-            self.logger.error(f"Error updating or inserting metadata: {e}")
-            cursor.connection.rollback()
-            raise
-
-    def get_available_versions(self):
-        try:
-            # Assuming SCHEMA_PATH is where your migration files are stored
-            versions = []
-            for entry in os.listdir(SCHEMA_PATH):
-                full_path = os.path.join(SCHEMA_PATH, entry)
-                if os.path.isdir(full_path):
-                    try:
-                        int_version = int(entry)
-                        versions.append({"version": int_version, "name": f"{entry}"})  # You might want to read the name from a file or config
-                    except ValueError:
-                        continue  # Skip entries that aren't integer directories
-            return sorted(versions, key=lambda x: x['version'])
-        except Exception as e:
-            self.logger.error(f"Failed to get available versions: {e}")
+            cursor = self.connection.cursor(dictionary=True)
+            cursor.execute("SELECT timestamp, name, status, applied_at FROM migrations WHERE status = 1 ORDER BY timestamp")
+            migrations = cursor.fetchall()
+            cursor.close()
+            return migrations
+        except Error as e:
+            if e.errno == 1146:  # Table doesn't exist
+                logger.debug("Migrations table does not exist; no applied migrations")
+                return []
+            logger.error(f"Error retrieving applied migrations: {e}")
             return []
 
-    def get_current_version(self, cursor):
+    def check_tables_exist(self) -> bool:
+        """Check if any tables exist in the database."""
+        if not self.ensure_connected():
+            logger.debug("No database connection; assuming no tables exist")
+            return False
         try:
-            cursor.execute("SELECT value FROM metadata WHERE `key` = 'migration_data'")
-            result = cursor.fetchone()
-            if not result:
-                self.logger.warn("No migration metadata found. Assuming version 0.")
-                return 0
-            data = json.loads(result[0])
-            return int(data.get("version", 0))
-        except Exception as e:
-            self.logger.error(f"Error fetching current version: {e}")
-            return 0  # or raise, depending on how you want to handle this
+            cursor = self.connection.cursor()
+            cursor.execute(
+                "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = %s",
+                (self.db_config['database'],)
+            )
+            count = cursor.fetchone()[0]
+            cursor.close()
+            logger.info(f"Found {count} tables in database")
+            return count > 0
+        except Error as e:
+            logger.error(f"Error checking table existence: {e}")
+            return False
 
-    def exec_sql_file(self, cursor, sql_file: str):
-        self.logger.info(f"Starting execution of SQL file: {sql_file}")
-        with open(sql_file, "r") as file:
-            statements = []
-            current_statement = ""
-
-            for line in file:
-                line = line.strip()
-                if line.startswith("--") or not line:
-                    continue
-                current_statement += line + " "
-                if line.endswith(";"):
-                    statements.append(current_statement.strip())
-                    current_statement = ""
-
-            if current_statement:  # In case the file doesn't end with a semicolon
-                statements.append(current_statement.strip())
-
-            for statement in statements:
-                if statement:
-                    try:
-                        cursor.execute(statement)
-                        self.logger.info(
-                            f"Executed SQL: {statement[:100]}..."
-                        )  # Log first 100 chars for brevity
-                    except mariadb.Error as e:
-                        self.logger.error(
-                            f"SQL Execution Error in {sql_file}: {
-                                e} for statement: {statement}"
-                        )
-                        raise
-        self.logger.info(f"Completed SQL file execution for {sql_file}")
-
-    def migrate(self, target_version: int) -> None:
-        with self._init_db() as conn:
-            with conn.cursor() as cursor:
-                
-                current_version = self.get_current_version(cursor)
-
-                if current_version == target_version:
-                    self.logger.warn(f"Already at version {target_version}. No migration needed.")
-                    return
-
-                self.logger.debug(f"Starting migration from version: {current_version} to target version: {target_version}")
-                
-                conn.autocommit = False
-                self.logger.debug("Autocommit is set to false for this migration session.")
-
-                versions = self.get_available_versions()
-
-                # If target_version is 0, set it to the oldest version available
-                if target_version == 0:
-                    target_version = min(version['version'] for version in versions)
-
-                for version in versions:
-                    if current_version < version['version'] <= target_version or \
-                    current_version > version['version'] >= target_version:
-                        action = "up" if version['version'] > current_version else "down"
-                        
-                        self.logger.info(f"Migrating {action} to version: {version['version']}")
-                        
-                        try:
-                            cursor.execute("START TRANSACTION")
-                            self.exec_sql_file(cursor, f"{SCHEMA_PATH}/{version['version']}/{action}.sql")
-                            new_version = version['version'] if action == 'up' else max((v['version'] for v in versions if v['version'] < version['version']), default=target_version)
-                            self._update_metadata(cursor, new_version)
-                            conn.commit()
-                            self.logger.info(f"Committed changes for version {version['version']}")
-                            current_version = new_version
-                        except Exception as e:
-                            conn.rollback()
-                            self.logger.error(f"Rolling back migration due to error: {e}")
-                            raise
-
-                if current_version != target_version:
-                    raise ValueError(f"Migration ended at version {current_version}, expected {target_version}")
-                else:
-                    self.logger.info(f"Migration completed to version {current_version}")
-
-
-class Logger:
-    def __init__(self, quiet=False):
-        self.logger = logging.getLogger('migrator_logger')
-        if not self.logger.handlers:  # Check if handlers are already added
-            self.logger.setLevel(logging.DEBUG if not quiet else logging.WARNING)
-            handler = logging.StreamHandler()
-            handler.setFormatter(logging.Formatter(
-                fmt="%(asctime)s [%(levelname)s] %(message)s",
-                datefmt="%Y-%m-%d %H:%M:%S"
-            ))
-            self.logger.addHandler(handler)
-
-        if quiet:
-            self.info = lambda msg: None # NOP
-        else:
-            self.info = self.logger.info
-
-    def warn(self, msg):
-        self.logger.warning(msg)
-
-    def error(self, msg):
-        self.logger.error(msg)
-
-    def debug(self, msg):
-        self.logger.debug(msg)
-
-    # Redefine to hide implementation details
-    def info(self, msg):
-        self.logger.info(msg)
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(prog=NAME, description=f"{NAME} v{VERSION}")
-    parser.add_argument("-q", "--quiet", action="store_true", help="Do not print informational messages")
-    subparsers = parser.add_subparsers(dest="command")
-
-    # Add subparsers for different commands
-    subparsers.add_parser("list", help="Lists all available overlay schema versions")
-    subparsers.add_parser("status", help="Show the current status")
-    create_parser = subparsers.add_parser("create", help="Create a new overlay schema version")
-
-    migrate_parser = subparsers.add_parser("migrate", help="Migration sub-commands")
-    migrate_parser.add_argument("--to", type=int, help="Target version to migrate to")
-    migrate_parser.add_argument("--to-latest", action="store_true", help="Migrate to the latest version")
-
-    args = parser.parse_args()
-    logger = Logger(args.quiet)
-    migrator = Migrator(logger)
-
-    if args.command == "list":
-        versions = migrator.get_available_versions()
-        for version in versions:
-            print(f"{version['version']} - {version['name']}")
-    elif args.command == "status":
-        with migrator._init_db() as conn, conn.cursor() as cursor:
-            print(f"Current version: {migrator.get_current_version(cursor)}")
-    elif args.command == "create":
-        schema_details = migrator.create_schema()
-        if schema_details:
-            logger.info(f"New schema created: {schema_details}")
-        else:
-            logger.error("Failed to create schema!")
-            sys.exit(1)
-    elif args.command == "migrate":
-        if args.to is not None and args.to_latest:
-            logger.error("Cannot specify --to and --to-latest at the same time.")
-            sys.exit(1)
-        elif args.to_latest:
-            versions = migrator.get_available_versions()
-            if versions:  # Check if there are any versions available
-                target_version = max(version['version'] for version in versions)
+    def validate_schema(self, full_validation: bool = False) -> bool:
+        """Validate schema integrity (tables, foreign keys)."""
+        if not self.ensure_connected():
+            logger.debug("No database connection; schema validation skipped")
+            return False
+        try:
+            cursor = self.connection.cursor()
+            if not full_validation:
+                cursor.execute(
+                    "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = %s AND table_name = 'migrations'",
+                    (self.db_config['database'],)
+                )
+                count = cursor.fetchone()[0]
+                cursor.close()
+                return count == 1
             else:
-                logger.error("No migration versions found.")
-                sys.exit(1)
-        elif args.to is not None:
-            target_version = args.to
+                cursor.execute(
+                    "SELECT COUNT(*) FROM information_schema.table_constraints "
+                    "WHERE constraint_type = 'FOREIGN KEY' AND table_schema = %s",
+                    (self.db_config['database'],)
+                )
+                fk_count = cursor.fetchone()[0]
+                cursor.execute(
+                    "SELECT COUNT(*) FROM information_schema.tables "
+                    "WHERE table_schema = %s AND table_name IN (%s)",
+                    (self.db_config['database'], ','.join([
+                        'migrations', 'users', 'community_members', 'posts', 'post_embeddings',
+                        'post_moderation_categories', 'user_bans', 'user_warnings',
+                        'notifications', 'oauth_sessions', 'moderation_actions',
+                        'appeals', 'user_reputation_logs', 'logs', 'moderation_categories',
+                        'user_notes', 'settings', 'community_settings'
+                    ]))
+                )
+                table_count = cursor.fetchone()[0]
+                cursor.close()
+                logger.info(f"Schema validation: {fk_count} foreign keys, {table_count}/18 expected tables")
+                return fk_count > 0 and table_count == 18
+        except Error as e:
+            logger.error(f"Error validating schema: {e}")
+            return False
+
+    def check_data_loss(self, script_path: Path) -> bool:
+        """Check if a migration script contains data-loss operations."""
+        try:
+            with open(script_path, 'r') as f:
+                sql = f.read().lower()
+            destructive_keywords = ['drop table', 'delete from', 'truncate table', 'drop column']
+            return any(keyword in sql for keyword in destructive_keywords)
+        except FileNotFoundError:
+            logger.error(f"Script not found: {script_path}")
+            return False
+
+    def get_next_migration_name(self) -> str:
+        """Get the next unused migration name from names.py."""
+        existing = self.list_migrations()
+        used_names = {m['name'] for m in existing}
+        for adj in ADJECTIVES:
+            for last in LAST_NAMES:
+                name = f"{adj}-{last}"
+                if name not in used_names:
+                    return name
+        timestamp = str(int(time.time()))
+        logger.warning(f"No unused migration names available; using fallback: migration-{timestamp}")
+        return f"migration-{timestamp}"
+
+    def create_migration(self, non_interactive: bool = False) -> None:
+        """Create a new migration with an automatically assigned name."""
+        name = self.get_next_migration_name()
+        timestamp = str(int(time.time()))
+        migration_dir = self.migrations_dir / f"{timestamp}_{name}"
+        try:
+            migration_dir.mkdir(parents=True, exist_ok=False)
+        except FileExistsError:
+            logger.error(f"Migration directory {migration_dir} already exists")
+            raise ValueError(f"Migration directory {migration_dir} already exists")
+
+        up_path = migration_dir / 'up.sql'
+        down_path = migration_dir / 'down.sql'
+        created_on = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        template = (
+            f"-- Migration: {name}\n"
+            f"-- Created On: {created_on}\n"
+            f"--\n"
+            f"-- DO NOT EDIT THIS FILE AFTER COMMIT\n"
+            f"-- CREATE A NEW MIGRATION INSTEAD\n"
+            f"--\n"
+        )
+        up_path.write_text(template)
+        down_path.write_text(template)
+        logger.info(f"Created migration: {migration_dir} with up.sql and down.sql")
+
+    def list_available_migrations(self) -> List[Dict]:
+        """List all valid migration directories from the filesystem."""
+        available = []
+        if not self.migrations_dir.exists():
+            logger.warning(f"Migrations directory {self.migrations_dir} does not exist")
+            return available
+        for d in self.migrations_dir.iterdir():
+            if d.is_dir():
+                match = re.match(r'^(\d+)_([a-z0-9-]+)$', d.name)
+                if match:
+                    timestamp, name = match.groups()
+                    up_file = d / 'up.sql'
+                    down_file = d / 'down.sql'
+                    if up_file.exists() and down_file.exists():
+                        available.append({'timestamp': timestamp, 'name': name})
+                    else:
+                        logger.warning(f"Skipping migration {d.name}: missing up.sql or down.sql")
+                else:
+                    logger.debug(f"Skipping directory {d.name}: does not match timestamp_adj-last pattern")
+        return sorted(available, key=lambda x: int(x['timestamp']))
+
+    def list_migrations(self) -> List[Dict]:
+        """List all migrations with their status."""
+        try:
+            available = self.list_available_migrations()
+            applied = self.get_applied_migrations()
+            applied_dict = {f"{m['timestamp']}_{m['name']}": m for m in applied}
+            migrations = []
+            for mig in available:
+                key = f"{mig['timestamp']}_{mig['name']}"
+                status = applied_dict.get(key, {}).get('status', 0)  # 0=PENDING
+                applied_at = applied_dict.get(key, {}).get('applied_at')
+                migrations.append({
+                    'timestamp': mig['timestamp'],
+                    'name': mig['name'],
+                    'status': ['PENDING', 'APPLIED', 'FAILED'][status],
+                    'applied_at': applied_at
+                })
+            return migrations
+        except Exception as e:
+            logger.error(f"Failed to list migrations: {e}")
+            return []
+
+    def get_status(self) -> Dict:
+        """Get the current migration status."""
+        migrations = self.list_migrations()
+        applied = [m for m in migrations if m['status'] == 'APPLIED']
+        current = max(applied, key=lambda m: int(m['timestamp'])) if applied else None
+        ahead = [m for m in migrations if m['status'] == 'PENDING' and (not current or int(m['timestamp']) > int(current['timestamp']))]
+        behind = [m for m in migrations if m['status'] == 'APPLIED' and current and int(m['timestamp']) < int(current['timestamp'])]
+        return {
+            'current': current,
+            'ahead': ahead,
+            'behind': behind,
+            'all_migrations': sorted(migrations, key=lambda x: int(x['timestamp']))
+        }
+
+    def resolve_version(self, version: str) -> Optional[Dict]:
+        """Resolve a version string to a migration (by timestamp or name)."""
+        migrations = self.list_migrations()
+        for m in migrations:
+            if version == m['timestamp'] or version == m['name']:
+                return m
+        return None
+
+    @retry(stop_max_attempt_number=3, wait_exponential_multiplier=1000, wait_exponential_max=10000)
+    def apply_migration(self, timestamp: str, name: str, direction: str, dry_run: bool = False, ignore_warnings: bool = False) -> None:
+        """Apply a migration and update its status."""
+        if not self.ensure_connected():
+            logger.error("Cannot apply migration: no database connection")
+            raise RuntimeError("Database connection failed")
+        migration_dir = self.migrations_dir / f"{timestamp}_{name}"
+        script_path = migration_dir / f"{direction}.sql"
+        if not script_path.exists():
+            logger.error(f"Script not found: {script_path}")
+            raise FileNotFoundError(f"Script not found: {script_path}")
+        try:
+            with open(script_path, 'r') as f:
+                sql = f.read()
+            if not sql.strip():
+                logger.info(f"Script {script_path} is empty; skipping execution")
+                return
+            # Remove comments and split statements
+            sql_clean = strip_sql_comments(sql)
+            logger.debug(f"Cleaned SQL for {timestamp}_{name} ({direction}):\n{sql_clean}")
+            statements = split_sql_statements(sql_clean)
+            if dry_run:
+                logger.info(f"Dry run: Would apply {direction} migration {timestamp}_{name}")
+                for i, stmt in enumerate(statements, 1):
+                    logger.info(f"Statement {i}: {stmt}")
+                return
+            if direction == 'down' and self.check_data_loss(script_path) and not ignore_warnings:
+                logger.warning(f"Potential data loss detected in {script_path}")
+                if not ignore_warnings:
+                    confirm = input("This migration may cause data loss. Proceed? (y/n): ").strip().lower()
+                    if confirm != 'y':
+                        logger.info("Migration aborted by user")
+                        return
+            cursor = self.connection.cursor()
+            for i, statement in enumerate(statements, 1):
+                logger.debug(f"Executing statement {i} for {timestamp}_{name} ({direction}): {statement}")
+                cursor.execute(statement)
+            if direction == 'up':
+                cursor.execute(
+                    "INSERT INTO migrations (timestamp, name, status, applied_at) "
+                    "VALUES (%s, %s, %s, %s) "
+                    "ON DUPLICATE KEY UPDATE status = %s, applied_at = %s",
+                    (int(timestamp), name, 1, datetime.now(), 1, datetime.now())
+                )
+            else:
+                cursor.execute(
+                    "UPDATE migrations SET status = %s, applied_at = NULL WHERE timestamp = %s",
+                    (0, int(timestamp))
+                )
+            self.connection.commit()
+            cursor.close()
+            logger.info(f"Applied {direction} migration: {timestamp}_{name}")
+        except Error as e:
+            logger.error(f"Error applying migration {timestamp}_{name} ({direction}): {e}")
+            self.connection.rollback()
+            raise
+
+    def run(self, target_version: Optional[str] = None, dry_run: bool = False, ignore_warnings: bool = False) -> None:
+        """Run migrations to the target version or latest."""
+        if not self.ensure_connected():
+            logger.error("Cannot run migrations: no database connection")
+            raise RuntimeError("Database connection failed")
+        try:
+            migrations = self.list_migrations()
+            applied = [m['timestamp'] for m in migrations if m['status'] == 'APPLIED']
+            available = sorted([(m['timestamp'], m['name']) for m in migrations], key=lambda x: int(x[0]))
+            if not available:
+                logger.info("No migrations available")
+                return
+            target_timestamp = available[-1][0] if not target_version else None
+            if target_version:
+                target = self.resolve_version(target_version)
+                if not target:
+                    logger.error(f"Version {target_version} not found")
+                    raise ValueError(f"Version {target_version} not found")
+                target_timestamp = target['timestamp']
+            if not self.check_tables_exist():
+                logger.info("No tables detected; applying all migrations")
+                for timestamp, name in available:
+                    if timestamp not in applied:
+                        self.apply_migration(timestamp, name, 'up', dry_run, ignore_warnings)
+                return
+            current = max([int(t) for t in applied] + [0])
+            target = int(target_timestamp)
+            if target > current:
+                direction = 'up'
+                to_apply = [(t, n) for t, n in available if int(t) > current and int(t) <= target]
+                logger.info(f"Migrating up to {target_timestamp}: {len(to_apply)} versions")
+            else:
+                direction = 'down'
+                to_apply = [(t, n) for t, n in reversed(available) if int(t) <= current and int(t) > target]
+                logger.info(f"Migrating down to {target_timestamp}: {len(to_apply)} versions")
+            for timestamp, name in to_apply:
+                if not dry_run and not self.validate_schema():
+                    logger.error("Schema validation failed before migration")
+                    raise ValueError("Schema validation failed")
+                self.apply_migration(timestamp, name, direction, dry_run, ignore_warnings)
+        except Exception as e:
+            logger.error(f"Migration run failed: {e}")
+            raise
+        finally:
+            self.close()
+
+    def add_global_admin(self, username: str) -> None:
+        """
+        Add a global admin by username.
+        If the user exists, sets is_global_admin to 1.
+        If not, inserts a new user with x_user_id='?', username, display_name=username, and is_global_admin=1.
+        """
+        username = username.lstrip('@')
+        if not self.ensure_connected():
+            logger.error("Cannot add global admin: no database connection")
+            raise RuntimeError("Database connection failed")
+        try:
+            cursor = self.connection.cursor()
+            cursor.execute("SELECT id FROM users WHERE username = %s", (username,))
+            user = cursor.fetchone()
+            if user:
+                cursor.execute("UPDATE users SET is_global_admin = 1 WHERE id = %s", (user[0],))
+                logger.info(f"Updated user @{username} to global admin")
+            else:
+                display_name = username
+                cursor.execute(
+                    "INSERT INTO users (x_user_id, username, display_name, is_global_admin) "
+                    "VALUES (%s, %s, %s, %s)",
+                    ("?", username, display_name, 1)
+                )
+                logger.info(f"Inserted new user @{username} as global admin")
+            self.connection.commit()
+            cursor.close()
+        except Error as e:
+            logger.error(f"Error adding global admin for @{username}: {e}")
+            self.connection.rollback()
+            raise
+
+    def remove_global_admin(self, username: str) -> None:
+        """
+        Remove global admin status by username.
+        If the user exists, sets is_global_admin to 0.
+        If not, logs a warning.
+        """
+        username = username.lstrip('@')
+        if not self.ensure_connected():
+            logger.error("Cannot remove global admin: no database connection")
+            raise RuntimeError("Database connection failed")
+        try:
+            cursor = self.connection.cursor()
+            cursor.execute("SELECT id FROM users WHERE username = %s", (username,))
+            user = cursor.fetchone()
+            if user:
+                cursor.execute("UPDATE users SET is_global_admin = 0 WHERE id = %s", (user[0],))
+                logger.info(f"Removed global admin status from user @{username}")
+            else:
+                logger.warning(f"User @{username} does not exist; cannot remove global admin status")
+            self.connection.commit()
+            cursor.close()
+        except Error as e:
+            logger.error(f"Error removing global admin for @{username}: {e}")
+            self.connection.rollback()
+            raise
+
+    def run_query(self, query: str, ignore_warnings: bool = False) -> None:
+        """
+        Run a SQL query and display the results.
+        For SELECT queries, displays a formatted table with string truncation.
+        For other queries, executes and reports affected rows.
+        """
+        if not self.ensure_connected():
+            logger.error("Cannot run query: no database connection")
+            raise RuntimeError("Database connection failed")
+        try:
+            # Create a new connection with autocommit=True for this query
+            query_conn = connect(**self.db_config, autocommit=True)
+            cursor = query_conn.cursor(dictionary=True)
+            if query.lower().strip().startswith("select"):
+                cursor.execute(query)
+                rows = cursor.fetchall()
+                if rows:
+                    # Truncate strings longer than 30 characters
+                    def truncate_value(v, max_length=30):
+                        s = str(v)
+                        if len(s) > max_length:
+                            return s[:max_length - 2] + ".."
+                        return s
+                    truncated_rows = [{k: truncate_value(v) for k, v in row.items()} for row in rows]
+                    print(tabulate(truncated_rows, headers="keys", tablefmt="grid"))
+                else:
+                    print("No rows returned.")
+            else:
+                if not ignore_warnings:
+                    confirm = input("This query may modify data. Proceed? (y/n): ").strip().lower()
+                    if confirm != 'y':
+                        logger.info("Query execution aborted by user")
+                        return
+                cursor.execute(query)
+                affected_rows = cursor.rowcount
+                print(f"Query executed successfully. Affected rows: {affected_rows}")
+            cursor.close()
+            query_conn.close()
+        except Error as e:
+            logger.error(f"Error executing query: {e}")
+            raise
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description="X-Moderator Database Migrator")
+    parser.add_argument('--to', type=str, help="Migrate to a specific version (timestamp or name)")
+    parser.add_argument('--to-latest', action='store_true', help="Migrate to the latest version")
+    parser.add_argument('--new', action='store_true', help="Create a new migration with an auto-generated name")
+    parser.add_argument('--dry-run', action='store_true', help="Preview migrations without applying")
+    parser.add_argument('--ignore-warnings', action='store_true', help="Ignore warnings (e.g., data loss) for non-interactive use")
+    parser.add_argument('--list', action='store_true', help="List available and applied migrations")
+    parser.add_argument('--status', action='store_true', help="Show current migration status")
+    parser.add_argument('--verbose', action='store_true', help="Enable verbose logging")
+    parser.add_argument('--add-global-admin', type=str, help="Add a global admin by username (e.g., @username)")
+    parser.add_argument('--remove-global-admin', type=str, help="Remove a global admin by username (e.g., @username)")
+    parser.add_argument('--run', type=str, help="Run a SQL query and display the results in a formatted table")
+    args = parser.parse_args()
+
+    if args.verbose:
+        logger.setLevel(logging.DEBUG)
+
+    migrator = Migrator()
+    try:
+        if args.add_global_admin:
+            logger.info(f"Adding global admin: {args.add_global_admin}")
+            migrator.add_global_admin(args.add_global_admin)
+        elif args.remove_global_admin:
+            logger.info(f"Removing global admin: {args.remove_global_admin}")
+            migrator.remove_global_admin(args.remove_global_admin)
+        elif args.run:
+            logger.info(f"Running query: {args.run}")
+            migrator.run_query(args.run, ignore_warnings=args.ignore_warnings)
+        elif args.list:
+            migrations = migrator.list_migrations()
+            if not migrations:
+                logger.info("No migrations found")
+            for migration in migrations:
+                print(f"Timestamp: {migration['timestamp']}, Name: {migration['name']}, Status: {migration['status']}, Applied: {migration['applied_at']}")
+        elif args.status:
+            status = migrator.get_status()
+            print("\nMigration Status Overview")
+            print("========================")
+            if not status['all_migrations']:
+                print("No migrations found.")
+            else:
+                table_data = []
+                current_timestamp = status['current']['timestamp'] if status['current'] else None
+                for mig in status['all_migrations']:
+                    is_current = mig['timestamp'] == current_timestamp
+                    status_str = f"*{mig['status']}*" if is_current else mig['status']
+                    table_data.append({
+                        'Migration ID': f"{mig['timestamp']}_{mig['name']}",
+                        'Name': mig['name'],
+                        'Timestamp': mig['timestamp'],
+                        'Status': status_str,
+                        'Applied At': mig['applied_at'] or 'N/A'
+                    })
+                print(tabulate(table_data, headers="keys", tablefmt="grid"))
+                print("\nLegend: *CURRENT* indicates the currently applied migration.")
+                print(f"Total Migrations: {len(status['all_migrations'])}")
+                print(f"Applied: {len(status['behind']) + (1 if status['current'] else 0)}")
+                print(f"Pending: {len(status['ahead'])}")
+        elif args.new:
+            migrator.create_migration(non_interactive=args.ignore_warnings)
+        elif args.to_latest:
+            migrator.run(dry_run=args.dry_run, ignore_warnings=args.ignore_warnings)
+        elif args.to:
+            migrator.run(target_version=args.to, dry_run=args.dry_run, ignore_warnings=args.ignore_warnings)
         else:
-            logger.error("Either --to or --to-latest must be specified.")
-            sys.exit(1)
-
-        migrator.migrate(target_version)
-
-        migrator.migrate(target_version)
-    else:
-        parser.print_help()
-        sys.exit(1)
+            parser.print_help()
+    except Exception as e:
+        logger.error(f"Command failed: {e}")
+        exit(1)
+    finally:
+        migrator.close()

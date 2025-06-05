@@ -1,0 +1,11 @@
+# Project specific
+migrator/*
+model/*
+target/*
+.dockerignore
+.editorconfig
+.gitattributes
+.gitignore
+example.config.toml
+*.txt
+*.md
