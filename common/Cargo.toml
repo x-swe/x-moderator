@@ -1,0 +1,8 @@
+[package]
+name = "xmod-common"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+diesel = { version = "2.2.10", features = ["mysql"] }
+serde = { version = "1.0", features = ["derive"] }
